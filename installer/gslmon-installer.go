@@ -7,7 +7,7 @@
 //          checks for Go compiler, installs dependencies, compiles gslmon from
 //          embedded source, and deploys as a systemd service.
 //
-// Build: go build -ldflags="-s -w" -o gslmon-installer installer.go
+// Build: go build -ldflags="-s -w" -o gslmon-installer gslmon-installer.go
 // Usage: sudo ./gslmon-installer
 //        sudo ./gslmon-installer --uninstall
 

@@ -31,9 +31,14 @@ Source Code Free to Distribute under GPL v3 License
 - [Recognized Error Patterns](#recognized-error-patterns)
 - [SMART Critical Attributes](#smart-critical-attributes)
 - [Prerequisites](#prerequisites)
-- [Quick Start](#quick-start)
+- [Automated Installer (Recommended)](#automated-installer-recommended)
+  - [Bash Installer](#bash-installer)
+  - [Go Self-Installer Binary](#go-self-installer-binary)
+  - [What the Installer Does](#what-the-installer-does)
+  - [Installer Uninstall](#installer-uninstall)
+- [Quick Start (Manual)](#quick-start-manual)
 - [Building from Source](#building-from-source)
-- [Installation](#installation)
+- [Installation (Manual)](#installation-manual)
 - [Systemd Service](#systemd-service)
 - [Supported Linux Distributions](#supported-linux-distributions)
 - [Troubleshooting](#troubleshooting)
@@ -443,7 +448,140 @@ Configurable via the `smart_critical_attribute_ids` array in config.
 
 ---
 
-## Quick Start
+## Automated Installer (Recommended)
+
+The easiest way to deploy gslmon is using the automated installer, which handles everything — dependency installation, RAID detection, configuration, compilation, and service setup.
+
+### Bash Installer
+
+```bash
+git clone https://github.com/hawkeye4iot/gslmon.git
+cd gslmon
+sudo bash installer/gslmon-installer.sh
+```
+
+The installer will guide you through an interactive setup:
+
+```
+========================================
+  gslmon Installer
+  RAID & Disk Health Monitor Daemon
+  Copyright (C) 2026 GetSetLive Pvt Ltd
+========================================
+
+[STEP]  === Phase 1: Dependencies ===
+[OK]    smartmontools already installed (smartctl 7.3)
+[OK]    mdadm already installed (mdadm - v4.2)
+[OK]    Go 1.22 already installed (>= 1.21 required)
+
+[STEP]  === Phase 2: RAID Detection ===
+[OK]    Detected software RAID: /dev/md1 (raid10) on /data
+[INFO]    Members: /dev/sdc /dev/sdd /dev/sde /dev/sdf
+
+[STEP]  === Phase 3: Email Configuration ===
+SMTP server hostname [localhost]: mail.example.com
+SMTP port [25]: 25
+Sender email (from) [gslmon@server.example.com]:
+Alert recipient email (to): alerts@example.com
+Server name for email subjects [server.example.com]:
+
+[STEP]  === Phase 4: Installation ===
+[OK]    Directories created
+[OK]    Configuration written to /etc/gslmon/config.json
+[OK]    Compilation successful
+[OK]    Binary installed to /usr/local/bin/gslmon
+[OK]    Service installed as gslmon.service
+
+========================================
+  gslmon Installation Complete
+========================================
+
+Start gslmon now? [Y/n]: Y
+[OK]    gslmon is running! Startup health email sent to alerts@example.com
+```
+
+### Go Self-Installer Binary
+
+For environments where you prefer a pre-compiled installer binary (no bash dependency):
+
+```bash
+# Build the installer binary on any machine with Go
+cd gslmon/installer
+go build -ldflags="-s -w" -o gslmon-installer gslmon-installer.go
+
+# Copy to target server and run
+scp gslmon-installer root@target-server:/tmp/
+ssh root@target-server
+cd /tmp
+# Ensure the gslmon source repo is available on the target
+git clone https://github.com/hawkeye4iot/gslmon.git
+cd gslmon
+/tmp/gslmon-installer
+```
+
+Or run directly from the cloned repo:
+
+```bash
+git clone https://github.com/hawkeye4iot/gslmon.git
+cd gslmon/installer
+go build -ldflags="-s -w" -o gslmon-installer gslmon-installer.go
+sudo ./gslmon-installer
+```
+
+### What the Installer Does
+
+The installer performs the following steps automatically:
+
+| Phase | Action | Details |
+|-------|--------|---------|
+| **1. OS Detection** | Identifies Linux distribution | Supports Ubuntu, Debian, RHEL, CentOS, AlmaLinux, Rocky, Fedora, openSUSE, Arch |
+| **2. Package Manager** | Auto-detects package manager | dnf, yum, apt-get, zypper, pacman |
+| **3. smartmontools** | Installs if missing | Required for SMART disk health monitoring |
+| **4. mdadm** | Installs if missing | Required for software RAID monitoring |
+| **5. Go Compiler** | Checks version, installs if needed | Tries package manager first; downloads official tarball from go.dev if distro version < 1.21 |
+| **6. RAID Detection** | Auto-detects RAID topology | Reads `/proc/mdstat` and `mdadm --detail` for software RAID; scans `smartctl --scan` for MegaRAID hardware RAID; falls back to individual disk detection via `lsblk` |
+| **7. Email Setup** | Interactive SMTP configuration | Prompts for SMTP server, port, sender, recipient, and server name |
+| **8. Config Generation** | Creates `/etc/gslmon/config.json` | Auto-populated with detected RAID array, member disks, and email settings |
+| **9. Compilation** | Builds gslmon from source | Compiles with `-ldflags="-s -w"` for optimized binary size |
+| **10. Service Install** | Deploys systemd service | Installs `gslmon.service`, runs `daemon-reload`, optionally starts and enables |
+
+**RAID Auto-Detection supports:**
+- **Software RAID (mdadm)**: Parses `/proc/mdstat` for active arrays, extracts array name, RAID level, mount point, and all member disk devices
+- **Hardware RAID (MegaRAID)**: Scans `smartctl --scan` output for megaraid pass-through devices (Dell PERC, Broadcom, LSI controllers)
+- **Individual Disks**: If no RAID is found, enumerates physical disks via `lsblk` for SMART-only monitoring
+
+**Go Compiler Provisioning:**
+- Checks if `go` exists in PATH or at `/usr/local/go/bin/go`
+- Validates version is >= 1.21
+- Tries distro package manager first (fastest)
+- Falls back to downloading the official Go tarball from `https://go.dev/dl/`
+- Installs to `/usr/local/go` and adds to system PATH via `/etc/profile.d/golang.sh`
+- Supports x86_64 (amd64), aarch64 (arm64), and armv7l architectures
+
+### Installer Uninstall
+
+Both installers support clean removal:
+
+```bash
+# Bash installer
+sudo bash installer/gslmon-installer.sh --uninstall
+
+# Go installer binary
+sudo ./gslmon-installer --uninstall
+```
+
+This will:
+- Stop and disable the gslmon systemd service
+- Remove the service unit file
+- Remove the binary from `/usr/local/bin/`
+- Remove log, state, and PID directories
+- Preserve `/etc/gslmon/config.json` (remove manually if needed)
+
+---
+
+## Quick Start (Manual)
+
+If you prefer manual installation without the automated installer:
 
 ```bash
 # Clone
@@ -489,7 +627,7 @@ GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o gslmon-arm64 main.go
 
 ---
 
-## Installation
+## Installation (Manual)
 
 See the [INSTALL](INSTALL) file for detailed step-by-step instructions including:
 - Go compiler installation for each distribution
