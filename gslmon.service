@@ -1,0 +1,29 @@
+# gslmon - RAID & Disk Health Monitor Daemon
+# Copyright (C) 2026 GetSetLive Pvt Ltd
+# Source Code Free to Distribute under GPL License
+#
+# Systemd unit file for gslmon daemon.
+# Adjust ExecStart and WorkingDirectory paths to match your installation.
+
+[Unit]
+Description=GSL RAID & Disk Health Monitor Daemon
+After=network-online.target mdmonitor.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gslmon /etc/gslmon/config.json
+WorkingDirectory=/var/lib/gslmon
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gslmon
+
+# Security hardening
+NoNewPrivileges=no
+ProtectSystem=false
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target

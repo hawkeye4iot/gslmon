@@ -1,0 +1,39 @@
+# Compiled binary
+gslmon
+
+# Configuration with real credentials
+config.json
+
+# Runtime state files
+state.json
+state.json.tmp
+
+# PID file
+gslmon.pid
+*.pid
+
+# Log files
+*.log
+
+# Temporary files
+tmp/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out

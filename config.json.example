@@ -1,0 +1,62 @@
+{
+    "email": {
+        "smtp_server": "your-smtp-server.example.com",
+        "smtp_port": 25,
+        "from": "gslmon@your-server.example.com",
+        "to": "alerts@your-domain.example.com",
+        "server_name": "your-server.example.com"
+    },
+    "raid": {
+        "array_device": "/dev/md1",
+        "array_name": "md1",
+        "raid_level": "raid10",
+        "mount_point": "/data",
+        "member_disks": [
+            {"device": "/dev/sdc", "name": "sdc"},
+            {"device": "/dev/sdd", "name": "sdd"},
+            {"device": "/dev/sde", "name": "sde"},
+            {"device": "/dev/sdf", "name": "sdf"}
+        ]
+    },
+    "monitoring": {
+        "log_check_interval_seconds": 30,
+        "mdstat_check_interval_seconds": 3600,
+        "smart_test_interval_days": 2,
+        "smart_check_interval_hours": 6,
+        "rebuild_check_interval_minutes": 30,
+        "alert_cooldown_minutes": 15,
+        "log_patterns": [
+            "DID_BAD_TARGET",
+            "I/O error",
+            "degraded",
+            "Disk failure",
+            "faulty",
+            "removed",
+            "hardreset",
+            "frozen",
+            "NCQ",
+            "ata[0-9].*error",
+            "ata[0-9].*exception",
+            "md/raid",
+            "super_written",
+            "journal abort",
+            "EXT4-fs.*error",
+            "SMART.*error",
+            "Reallocated",
+            "Uncorrectable",
+            "Current_Pending",
+            "read error",
+            "write error",
+            "recovering",
+            "disable device",
+            "FPDMA",
+            "hard resetting link",
+            "link is slow"
+        ],
+        "smart_critical_attribute_ids": [5, 10, 171, 172, 184, 187, 188, 197, 198, 199, 201]
+    },
+    "log_file": "/var/log/gslmon/gslmon.log",
+    "state_file": "/var/lib/gslmon/state.json",
+    "tmp_dir": "/var/lib/gslmon/tmp",
+    "pid_file": "/var/run/gslmon/gslmon.pid"
+}

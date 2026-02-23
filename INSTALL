@@ -1,0 +1,203 @@
+gslmon - RAID & Disk Health Monitor Daemon
+Copyright (C) 2026 GetSetLive Pvt Ltd
+Source Code Free to Distribute under GPL License
+
+================================================================================
+                          BUILD & INSTALLATION GUIDE
+================================================================================
+
+OVERVIEW
+--------
+gslmon is a daemon written in Go that monitors Linux software RAID (mdadm) and
+hardware RAID (megaraid pass-through) arrays. It checks kernel logs, /proc/mdstat,
+and SMART disk health data, sending HTML email alerts when issues are detected.
+
+Features:
+  - Kernel log monitoring via journalctl for RAID/disk error patterns
+  - /proc/mdstat polling for array state changes (degraded, recovering, etc.)
+  - Periodic SMART long self-tests with automated result checking
+  - RAID rebuild progress tracking with visual progress bar emails
+  - Alert cooldown to prevent email flooding
+  - Megaraid pass-through support for hardware RAID controllers
+  - PID file locking to prevent duplicate instances
+  - State persistence across daemon restarts
+
+PREREQUISITES
+-------------
+  - Go 1.21 or later (for compilation)
+  - smartmontools (provides smartctl)
+  - mdadm (for software RAID monitoring)
+  - systemd (for journalctl log access and service management)
+  - An SMTP server accessible from the host (for sending alerts)
+
+================================================================================
+                       INSTALLING GO COMPILER
+================================================================================
+
+Ubuntu / Debian:
+  sudo apt update
+  sudo apt install -y golang-go smartmontools mdadm
+
+  If the distro Go version is too old (<1.21), install from the official tarball:
+  wget https://go.dev/dl/go1.22.5.linux-amd64.tar.gz
+  sudo rm -rf /usr/local/go
+  sudo tar -C /usr/local -xzf go1.22.5.linux-amd64.tar.gz
+  export PATH=$PATH:/usr/local/go/bin
+
+Red Hat Enterprise Linux (RHEL) 8/9:
+  sudo dnf install -y golang smartmontools mdadm
+
+CentOS Stream 8/9:
+  sudo dnf install -y golang smartmontools mdadm
+
+AlmaLinux 8/9:
+  sudo dnf install -y golang smartmontools mdadm
+
+  If Go is not available in default repos (RHEL/CentOS 8):
+  sudo dnf install -y epel-release
+  sudo dnf install -y golang
+
+Rocky Linux 8/9:
+  sudo dnf install -y golang smartmontools mdadm
+
+Fedora:
+  sudo dnf install -y golang smartmontools mdadm
+
+openSUSE / SLES:
+  sudo zypper install go smartmontools mdadm
+
+Arch Linux:
+  sudo pacman -S go smartmontools mdadm
+
+================================================================================
+                           COMPILATION
+================================================================================
+
+Clone the repository:
+  git clone https://github.com/hawkeye4iot/gslmon.git
+  cd gslmon
+
+Build the binary:
+  go build -o gslmon main.go
+
+Build with optimizations (smaller binary, no debug symbols):
+  go build -ldflags="-s -w" -o gslmon main.go
+
+Verify the build:
+  ./gslmon
+  (Should print: "Usage: gslmon <config.json>")
+
+Cross-compile for different architectures:
+  GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o gslmon-amd64 main.go
+  GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o gslmon-arm64 main.go
+
+================================================================================
+                           INSTALLATION
+================================================================================
+
+1. Copy the binary:
+   sudo cp gslmon /usr/local/bin/
+   sudo chmod 755 /usr/local/bin/gslmon
+
+2. Create configuration directory and files:
+   sudo mkdir -p /etc/gslmon
+   sudo cp config.json.example /etc/gslmon/config.json
+   sudo chmod 640 /etc/gslmon/config.json
+
+3. Edit the configuration:
+   sudo vi /etc/gslmon/config.json
+
+   Update the following fields:
+   - email.smtp_server    : Your SMTP server hostname
+   - email.smtp_port      : SMTP port (typically 25 or 587)
+   - email.from           : Sender email address
+   - email.to             : Alert recipient email address
+   - email.server_name    : Hostname used in SMTP HELO and alert subjects
+   - raid.array_device    : Your RAID array device (e.g., /dev/md0)
+                            Leave empty "" for hardware RAID only
+   - raid.array_name      : Array name as shown in /proc/mdstat (e.g., md0)
+   - raid.member_disks    : List of member disk devices to monitor via SMART
+   - log_file             : Path for gslmon log output
+   - state_file           : Path for daemon state persistence
+   - tmp_dir              : Path for temporary files
+   - pid_file             : Path for PID lock file
+
+   For hardware RAID (e.g., Dell PERC / MegaRAID), set disk type:
+   "member_disks": [
+       {"device": "/dev/bus/0", "type": "megaraid,0", "name": "Disk 0"},
+       {"device": "/dev/bus/0", "type": "megaraid,1", "name": "Disk 1"}
+   ]
+
+4. Create runtime directories:
+   sudo mkdir -p /var/log/gslmon
+   sudo mkdir -p /var/lib/gslmon/tmp
+   sudo mkdir -p /var/run/gslmon
+
+5. Install the systemd service:
+   sudo cp gslmon.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+
+6. Start and enable the service:
+   sudo systemctl start gslmon
+   sudo systemctl enable gslmon
+
+7. Verify it is running:
+   sudo systemctl status gslmon
+   tail -f /var/log/gslmon/gslmon.log
+
+================================================================================
+                      CONFIGURATION REFERENCE
+================================================================================
+
+Email Configuration:
+  smtp_server                    SMTP relay hostname
+  smtp_port                      SMTP port (25 for unencrypted, 587 for STARTTLS)
+  from                           Sender address for alert emails
+  to                             Recipient address for alert emails
+  server_name                    Server identifier in email subjects and HELO
+
+RAID Configuration:
+  array_device                   MD array device path (empty for HW RAID only)
+  array_name                     Array name in /proc/mdstat
+  raid_level                     RAID level description (raid1, raid10, etc.)
+  mount_point                    Filesystem mount point of the array
+  member_disks[].device          Disk device path for SMART queries
+  member_disks[].type            SMART device type (empty for direct, "megaraid,N")
+  member_disks[].name            Human-readable disk name for reports
+
+Monitoring Configuration:
+  log_check_interval_seconds     How often to scan kernel logs (default: 30)
+  mdstat_check_interval_seconds  How often to poll /proc/mdstat (default: 3600)
+  smart_test_interval_days       Days between SMART long self-tests (default: 2)
+  smart_check_interval_hours     Hours between SMART health checks (default: 6)
+  rebuild_check_interval_minutes Minutes between rebuild progress checks (default: 30)
+  alert_cooldown_minutes         Minimum minutes between repeated alerts (default: 15)
+  log_patterns                   Regex patterns to match in kernel logs
+  smart_critical_attribute_ids   SMART attribute IDs flagged as critical
+
+SMART Critical Attribute IDs (defaults):
+  5   - Reallocated Sectors Count
+  10  - Spin Retry Count
+  171 - SSD Program Fail Count
+  172 - SSD Erase Fail Count
+  184 - End-to-End Error
+  187 - Reported Uncorrectable Errors
+  188 - Command Timeout
+  197 - Current Pending Sector Count
+  198 - Offline Uncorrectable
+  199 - UDMA CRC Error Count
+  201 - Soft Read Error Rate
+
+================================================================================
+                         UNINSTALLATION
+================================================================================
+
+  sudo systemctl stop gslmon
+  sudo systemctl disable gslmon
+  sudo rm /etc/systemd/system/gslmon.service
+  sudo systemctl daemon-reload
+  sudo rm /usr/local/bin/gslmon
+  sudo rm -rf /etc/gslmon
+  sudo rm -rf /var/log/gslmon
+  sudo rm -rf /var/lib/gslmon
+  sudo rm -rf /var/run/gslmon
