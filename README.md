@@ -67,38 +67,7 @@ Source Code Free to Distribute under GPL v3 License
 
 ## Architecture Overview
 
-```
-                    +---------------------+
-                    |    gslmon daemon     |
-                    |    (single binary)   |
-                    +----------+----------+
-                               |
-              +----------------+----------------+
-              |                |                |               |
-     +--------v------+ +------v-------+ +------v-------+ +----v-----------+
-     | Log Monitor   | | mdstat       | | SMART        | | Rebuild        |
-     | (journalctl)  | | Monitor      | | Monitor      | | Monitor        |
-     | interval: 30s | | interval: 1h | | interval: 6h | | interval: 30m  |
-     +--------+------+ +------+-------+ +------+-------+ +----+-----------+
-              |                |                |               |
-              v                v                v               v
-     +--------+------+ +------+-------+ +------+-------+ +----+-----------+
-     | Pattern Match | | State Change | | Attribute    | | Progress       |
-     | & Classify    | | Detection    | | Analysis     | | Tracking       |
-     +--------+------+ +------+-------+ +------+-------+ +----+-----------+
-              |                |                |               |
-              +----------------+----------------+---------------+
-                               |
-                    +----------v----------+
-                    |   Alert Cooldown    |
-                    |   & Deduplication   |
-                    +----------+----------+
-                               |
-                    +----------v----------+
-                    |  HTML Email Engine   |
-                    |  (SMTP direct send)  |
-                    +---------------------+
-```
+![gslmon Architecture](docs/architecture.png)
 
 ---
 
