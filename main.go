@@ -85,6 +85,7 @@ type MonitorConfig struct {
 	RebuildCheckIntervalMin  int      `json:"rebuild_check_interval_minutes"`
 	AlertCooldownMin         int      `json:"alert_cooldown_minutes"`
 	LogPatterns              []string `json:"log_patterns"`
+	LogExcludePatterns       []string `json:"log_exclude_patterns"`
 	SmartCriticalIDs         []int    `json:"smart_critical_attribute_ids"`
 }
 
@@ -160,12 +161,23 @@ type MdstatInfo struct {
 	RawOutput   string
 }
 
+// HWRaidRebuildInfo holds rebuild progress data from perccli64/storcli64 for hardware RAID controllers.
+// Created: 2026-02-28 — Parallel to MdstatInfo for hardware RAID (Dell PERC) rebuild monitoring
+type HWRaidRebuildInfo struct {
+	DriveID      string  // e.g. "/c0/e32/s3"
+	DriveName    string  // e.g. "Disk 3" (from config member_disks)
+	RebuildPct   string  // e.g. "20%"
+	IsRebuilding bool
+	RawOutput    string  // full perccli64 output for email body
+}
+
 // ==================== Globals ====================
 
 var (
 	cfg    Config
 	state  State
 	logger *log.Logger
+	hwRaidCLI string // Runtime-detected path to perccli64 or storcli64
 
 	// Error explanations keyed by pattern
 	errorExplanations = map[string]string{
@@ -183,7 +195,7 @@ var (
 		"md/raid":              "MD RAID subsystem event. A significant change occurred in the software RAID layer.",
 		"super_written":        "Error writing the RAID superblock to a member disk. The disk may be failing or unreachable.",
 		"journal abort":        "The ext4 filesystem journal has been aborted due to I/O errors. The filesystem may be remounted read-only.",
-		"EXT4-fs.*md1.*error":  "ext4 filesystem error on the RAID array. Usually caused by underlying disk I/O failures.",
+		"EXT4-fs.*error":       "ext4 filesystem error detected. Usually caused by underlying disk I/O failures affecting the storage device.",
 		"SMART.*error":         "SMART subsystem reported an error on a drive. The drive's self-monitoring has detected an issue.",
 		"Reallocated":          "Drive has remapped bad sectors to spare area. High or increasing counts indicate drive degradation.",
 		"Uncorrectable":        "Uncorrectable read errors detected. Data in affected sectors could not be recovered by the drive's ECC.",
@@ -195,6 +207,20 @@ var (
 		"FPDMA":                "First-party DMA (FPDMA) command timeout. NCQ read/write commands did not complete in time.",
 		"hard resetting link":  "Kernel is performing a hard reset on the SATA physical link to attempt drive recovery.",
 		"link is slow":         "SATA link is responding slowly. The kernel is waiting for the drive to become ready after a reset.",
+		// Pre-degradation warning patterns — added 2026-03-30
+		// Purpose: Detect early symptoms of disk failure before RAID enters degraded state
+		"exception Emask":             "ATA exception with error mask — indicates the drive reported an abnormal condition. Often the first sign before NCQ freeze and drive removal.",
+		"link is slow to respond":     "SATA link responding slowly during reset. The drive is struggling to re-establish communication — a pre-failure warning sign.",
+		"reset failed":                "Hard reset on the SATA link failed completely. The kernel could not recover the drive — imminent disk loss.",
+		"Buffer I/O error":            "Block layer I/O failure — the kernel could not complete a read/write at the block device level. Indicates underlying disk or controller failure.",
+		"Remounting filesystem read-only": "Filesystem forced into read-only mode due to I/O errors. Data writes are no longer possible — immediate attention required.",
+		"sector.*error":               "Sector-level error detected on a storage device. May indicate media degradation or failing drive firmware.",
+		"medium error":                "SCSI medium error — the drive's physical media returned an unrecoverable error. Bad sectors or surface damage suspected.",
+		"task abort":                  "SATA command was aborted by the drive. The drive rejected or could not process the I/O request — may indicate firmware hang or failure.",
+		"revalidation failed":         "Drive revalidation failed after a SATA link reset. The kernel could not re-identify the device — the drive may be offline or dying.",
+		"lost page write":             "Write data lost due to I/O failure. Written data did not reach the disk — potential data corruption and drive failure indicator.",
+		"Input/output error":          "Generic I/O error from userspace or kernel subsystem. Indicates a storage device could not complete the requested operation.",
+		"SATA link down":              "SATA physical link has gone down. The drive is no longer electrically connected or responding on the SATA bus.",
 	}
 )
 
@@ -297,7 +323,7 @@ func runSmartctl(args []string, disk DiskConfig) (string, string, error) {
 func sendEmail(subject, htmlBody string) error {
 	addr := fmt.Sprintf("%s:%d", cfg.Email.SMTPServer, cfg.Email.SMTPPort)
 
-	headers := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=UTF-8\r\nX-Mailer: gslmon/1.0\r\nDate: %s\r\n\r\n",
+	headers := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=UTF-8\r\nX-Mailer: gslmon/1.1\r\nDate: %s\r\n\r\n",
 		cfg.Email.From,
 		cfg.Email.To,
 		subject,
@@ -460,20 +486,36 @@ func monitorLogs(stopCh <-chan struct{}, wg *sync.WaitGroup) {
 		patternNames = append(patternNames, p)
 	}
 
+	// Compile exclude patterns — lines matching any of these are skipped even if they match alert patterns
+	// Added: 2026-03-01 — Filter out non-RAID device noise (e.g. nbd, loop, dm devices)
+	var excludePatterns []*regexp.Regexp
+	for _, p := range cfg.Monitor.LogExcludePatterns {
+		re, err := regexp.Compile("(?i)" + p)
+		if err != nil {
+			logger.Printf("Invalid log exclude pattern '%s': %v", p, err)
+			continue
+		}
+		excludePatterns = append(excludePatterns, re)
+	}
+	if len(excludePatterns) > 0 {
+		logger.Printf("Log exclude patterns: %d loaded", len(excludePatterns))
+	}
+
 	for {
 		select {
 		case <-stopCh:
 			logger.Printf("Log monitor stopping")
 			return
 		case <-ticker.C:
-			checkLogs(patterns, patternNames)
+			checkLogs(patterns, patternNames, excludePatterns)
 		}
 	}
 }
 
 // checkLogs runs a single log check cycle.
 // Created: 2026-02-11 — Fetches new kernel log entries and matches against patterns
-func checkLogs(patterns []*regexp.Regexp, patternNames []string) {
+// Updated: 2026-03-01 — Added excludePatterns to skip non-RAID device noise (nbd, loop, etc.)
+func checkLogs(patterns []*regexp.Regexp, patternNames []string, excludePatterns []*regexp.Regexp) {
 	state.mu.Lock()
 	since := state.LastLogCheck
 	state.mu.Unlock()
@@ -507,6 +549,19 @@ func checkLogs(patterns []*regexp.Regexp, patternNames []string) {
 	scanner := bufio.NewScanner(strings.NewReader(stdout))
 	for scanner.Scan() {
 		line := scanner.Text()
+
+		// Skip lines matching any exclude pattern (non-RAID devices like nbd, loop, dm)
+		excluded := false
+		for _, exRe := range excludePatterns {
+			if exRe.MatchString(line) {
+				excluded = true
+				break
+			}
+		}
+		if excluded {
+			continue
+		}
+
 		for i, re := range patterns {
 			if re.MatchString(line) {
 				severity := classifySeverity(patternNames[i])
@@ -527,14 +582,29 @@ func checkLogs(patterns []*regexp.Regexp, patternNames []string) {
 		return
 	}
 
-	if !canSendAlert("log_alert") {
-		logger.Printf("Log alert suppressed (cooldown): %d matches found", len(alerts))
+	// Per-severity cooldown — added 2026-03-30
+	// Purpose: Ensure CRITICAL pre-degradation alerts are never suppressed by
+	// a WARNING/INFO cooldown. Each severity level has its own independent cooldown.
+	maxSeverity := "INFO"
+	for _, a := range alerts {
+		if a.Severity == "CRITICAL" {
+			maxSeverity = "CRITICAL"
+			break
+		}
+		if a.Severity == "WARNING" {
+			maxSeverity = "WARNING"
+		}
+	}
+	cooldownKey := "log_alert_" + maxSeverity
+
+	if !canSendAlert(cooldownKey) {
+		logger.Printf("Log alert suppressed (cooldown %s): %d matches found", cooldownKey, len(alerts))
 		return
 	}
 
-	logger.Printf("Sending log alert: %d suspicious entries found", len(alerts))
+	logger.Printf("Sending log alert: %d suspicious entries found (severity: %s)", len(alerts), maxSeverity)
 	sendLogAlertEmail(alerts, cmd)
-	recordAlert("log_alert")
+	recordAlert(cooldownKey)
 	saveState()
 }
 
@@ -542,9 +612,13 @@ func checkLogs(patterns []*regexp.Regexp, patternNames []string) {
 // Created: 2026-02-11 — Categorizes log events by severity for alert prioritization
 func classifySeverity(pattern string) string {
 	critical := []string{"DID_BAD_TARGET", "Disk failure", "faulty", "journal abort",
-		"disable device", "super_written", "I/O error"}
+		"disable device", "super_written", "I/O error",
+		"reset failed", "Buffer I/O error", "Remounting filesystem read-only",
+		"revalidation failed", "lost page write", "Input/output error", "SATA link down"}
 	warning := []string{"degraded", "hardreset", "frozen", "NCQ", "FPDMA",
-		"hard resetting link", "Uncorrectable", "Current_Pending", "Reallocated"}
+		"hard resetting link", "Uncorrectable", "Current_Pending", "Reallocated",
+		"exception Emask", "link is slow to respond", "sector.*error",
+		"medium error", "task abort"}
 
 	for _, c := range critical {
 		if strings.EqualFold(pattern, c) {
@@ -989,6 +1063,13 @@ func checkSmartHealth() {
 		}
 	}
 
+	// Check RAID array health — flag degraded arrays even if individual SMART is OK
+	// Added: 2026-03-01 — Prevents misleading "All Disks OK" when array is degraded
+	arrayDegraded, arrayStateMsg := checkArrayHealth()
+	if arrayDegraded {
+		allOK = false
+	}
+
 	// Check if an active test has completed
 	if testActive {
 		allComplete := true
@@ -1010,7 +1091,7 @@ func checkSmartHealth() {
 	}
 
 	// Send report email
-	sendSmartReportEmail(reports, allOK, needTest && !testActive)
+	sendSmartReportEmail(reports, allOK, needTest && !testActive, arrayDegraded, arrayStateMsg)
 }
 
 // initiateSmartTests starts a long SMART self-test on each member disk.
@@ -1218,15 +1299,31 @@ func parseSmartTestEntry(line string) *SmartTestEntry {
 
 // sendSmartReportEmail builds and sends a formatted SMART health report email.
 // Created: 2026-02-11 — Generates HTML SMART report with per-disk health summary
-func sendSmartReportEmail(reports []SmartDiskReport, allOK bool, testJustStarted bool) {
+// Updated: 2026-03-01 — Includes RAID array state to prevent misleading "All OK" on degraded arrays
+func sendSmartReportEmail(reports []SmartDiskReport, allOK bool, testJustStarted bool, arrayDegraded bool, arrayStateMsg string) {
 	var subject string
 	if allOK {
 		subject = fmt.Sprintf("Gslmon Information from %s: SMART Health Report — All Disks OK", cfg.Email.ServerName)
+	} else if arrayDegraded {
+		subject = fmt.Sprintf("Gslmon Critical from %s: SMART Health Report — RAID Array Degraded", cfg.Email.ServerName)
 	} else {
 		subject = fmt.Sprintf("Gslmon Critical from %s: SMART Health Issues Detected on RAID Disks", cfg.Email.ServerName)
 	}
 
 	var content strings.Builder
+
+	// Array state section — show degraded warning at top if applicable
+	// Added: 2026-03-01 — Prominent array health status before individual disk details
+	if arrayStateMsg != "" {
+		content.WriteString(`<div class="section">`)
+		content.WriteString(`<div class="section-title">RAID Array State</div>`)
+		if arrayDegraded {
+			content.WriteString(fmt.Sprintf(`<p class="info-text"><span class="badge badge-crit">DEGRADED</span> %s</p>`, escHTML(arrayStateMsg)))
+		} else {
+			content.WriteString(fmt.Sprintf(`<p class="info-text"><span class="badge badge-info">HEALTHY</span> %s</p>`, escHTML(arrayStateMsg)))
+		}
+		content.WriteString(`</div>`)
+	}
 
 	// Summary section
 	content.WriteString(`<div class="section">`)
@@ -1235,6 +1332,9 @@ func sendSmartReportEmail(reports []SmartDiskReport, allOK bool, testJustStarted
 	if allOK {
 		content.WriteString(`<p class="info-text"><span class="badge badge-info">OK</span> `)
 		content.WriteString(`All RAID member disks are reporting healthy SMART status. No critical attribute anomalies detected.</p>`)
+	} else if arrayDegraded {
+		content.WriteString(`<p class="info-text"><span class="badge badge-crit">ARRAY DEGRADED</span> `)
+		content.WriteString(fmt.Sprintf(`%s</p>`, escHTML(arrayStateMsg)))
 	} else {
 		content.WriteString(`<p class="info-text"><span class="badge badge-crit">ISSUES DETECTED</span> `)
 		content.WriteString(`One or more RAID member disks are reporting SMART anomalies. Immediate investigation recommended.</p>`)
@@ -1388,27 +1488,74 @@ func sendSmartReportEmail(reports []SmartDiskReport, allOK bool, testJustStarted
 
 // monitorRebuild periodically checks RAID rebuild progress and reports via email.
 // Created: 2026-02-11 — Sends rebuild progress every N hours and completion notification
+// Updated: 2026-02-28 — Supports both SW RAID (mdstat) and HW RAID (perccli64) paths
 func monitorRebuild(stopCh <-chan struct{}, wg *sync.WaitGroup) {
 	defer wg.Done()
-	logger.Printf("Rebuild monitor started (interval: %d min)", cfg.Monitor.RebuildCheckIntervalMin)
+	if isHardwareRAID() {
+		if hwRaidCLI != "" {
+			logger.Printf("Rebuild monitor started — hardware RAID via %s (interval: %d min)", filepath.Base(hwRaidCLI), cfg.Monitor.RebuildCheckIntervalMin)
+		} else {
+			logger.Printf("Rebuild monitor started — hardware RAID (WARNING: no CLI tool found, interval: %d min)", cfg.Monitor.RebuildCheckIntervalMin)
+		}
+	} else {
+		logger.Printf("Rebuild monitor started — software RAID via /proc/mdstat (interval: %d min)", cfg.Monitor.RebuildCheckIntervalMin)
+	}
 
-	ticker := time.NewTicker(time.Duration(cfg.Monitor.RebuildCheckIntervalMin) * time.Minute)
-	defer ticker.Stop()
+	// Immediate check on startup — don't wait for first ticker interval
+	// Added: 2026-02-28 — Ensures rebuild status is reported immediately on service start
+	checkRebuildProgress()
+
+	// Rebuild monitor uses two intervals:
+	// - Normal/progress reporting: 30-min ticker (configurable) — sends progress emails
+	// - Completion detection: 30-sec fast poll when rebuild is active — detects completion immediately
+	// Updated: 2026-03-01 — Fast completion detection so rebuild complete email is sent within ~30s
+	progressInterval := time.Duration(cfg.Monitor.RebuildCheckIntervalMin) * time.Minute
+	completionPollInterval := 30 * time.Second
+	progressTicker := time.NewTicker(progressInterval)
+	completionTicker := time.NewTicker(completionPollInterval)
+	defer progressTicker.Stop()
+	defer completionTicker.Stop()
 
 	for {
 		select {
 		case <-stopCh:
 			logger.Printf("Rebuild monitor stopping")
 			return
-		case <-ticker.C:
+		case <-progressTicker.C:
+			// Full check — sends progress email if rebuilding, or completion if just finished
 			checkRebuildProgress()
+		case <-completionTicker.C:
+			// Fast poll — only activates when rebuild is past 90% to detect completion within ~30s
+			// Updated: 2026-03-01 — Threshold-based fast poll to avoid unnecessary checks early in rebuild
+			state.mu.Lock()
+			wasActive := state.RebuildWasActive
+			lastPct := state.LastRebuildPct
+			state.mu.Unlock()
+			if wasActive {
+				pctVal := 0.0
+				pctStr := strings.TrimSuffix(lastPct, "%")
+				if v, err := strconv.ParseFloat(pctStr, 64); err == nil {
+					pctVal = v
+				}
+				if pctVal < 90.0 {
+					continue
+				}
+				checkRebuildCompletion()
+			}
 		}
 	}
 }
 
 // checkRebuildProgress reads current rebuild state and sends progress or completion email.
 // Created: 2026-02-11 — Tracks rebuild percentage and detects completion transitions
+// Updated: 2026-02-28 — Dispatches to HW RAID path for hardware RAID controllers
 func checkRebuildProgress() {
+	// Dispatch to hardware RAID path if applicable
+	if isHardwareRAID() {
+		checkHWRebuildProgress()
+		return
+	}
+
 	info, err := parseMdstat()
 	if err != nil {
 		logger.Printf("Rebuild progress check failed: %v", err)
@@ -1440,6 +1587,47 @@ func checkRebuildProgress() {
 
 		logger.Printf("Rebuild completed! Sending completion notification")
 		sendRebuildCompleteEmail(info)
+	}
+}
+
+// checkRebuildCompletion is a lightweight check that only detects rebuild-to-complete transitions.
+// Called every 30 seconds when a rebuild is known to be active, so completion is detected immediately
+// without waiting for the full 30-min progress ticker. Does NOT send progress emails (avoids flooding).
+// Created: 2026-03-01 — Fast completion detection for both SW and HW RAID
+func checkRebuildCompletion() {
+	if isHardwareRAID() {
+		if hwRaidCLI == "" {
+			return
+		}
+		rebuilds, err := parsePercRebuildProgress()
+		if err != nil {
+			return
+		}
+		if len(rebuilds) == 0 {
+			// No drives rebuilding — rebuild just completed
+			state.mu.Lock()
+			state.RebuildWasActive = false
+			state.LastRebuildPct = "100%"
+			state.mu.Unlock()
+			saveState()
+			logger.Printf("HW RAID rebuild completed! Sending completion notification (fast detection)")
+			sendHWRebuildCompleteEmail()
+		}
+	} else {
+		info, err := parseMdstat()
+		if err != nil {
+			return
+		}
+		if !info.IsRebuilding {
+			// Rebuild just completed
+			state.mu.Lock()
+			state.RebuildWasActive = false
+			state.LastRebuildPct = "100%"
+			state.mu.Unlock()
+			saveState()
+			logger.Printf("Rebuild completed! Sending completion notification (fast detection)")
+			sendRebuildCompleteEmail(info)
+		}
 	}
 }
 
@@ -1545,6 +1733,347 @@ func sendRebuildCompleteEmail(info *MdstatInfo) {
 	} else {
 		logger.Printf("Rebuild complete email sent: %s", subject)
 	}
+}
+
+// ==================== Hardware RAID Rebuild Monitoring ====================
+
+// detectHWRaidCLI scans standard paths for perccli64 or storcli64 CLI tools.
+// Created: 2026-02-28 — Auto-detects hardware RAID management CLI at runtime
+func detectHWRaidCLI() string {
+	paths := []string{
+		"/usr/local/bin/perccli64",
+		"/opt/MegaRAID/perccli/perccli64",
+		"/usr/local/bin/storcli64",
+		"/opt/MegaRAID/storcli/storcli64",
+		"/usr/local/bin/perccli",
+		"/usr/local/bin/storcli",
+	}
+	for _, p := range paths {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// isHardwareRAID returns true if the server uses a hardware RAID controller (no software RAID array device).
+// Created: 2026-02-28 — Checks config for empty array_device with megaraid-type member disks
+func isHardwareRAID() bool {
+	if cfg.RAID.ArrayDevice != "" {
+		return false
+	}
+	for _, d := range cfg.RAID.MemberDisks {
+		if strings.HasPrefix(d.Type, "megaraid,") {
+			return true
+		}
+	}
+	return false
+}
+
+// parsePercRebuildProgress runs perccli64 /c0/eall/sall show rebuild and parses the output.
+// Created: 2026-02-28 — Extracts drive IDs and rebuild percentages from perccli64 output
+func parsePercRebuildProgress() ([]HWRaidRebuildInfo, error) {
+	if hwRaidCLI == "" {
+		return nil, fmt.Errorf("no perccli64/storcli64 CLI tool available")
+	}
+
+	stdout, stderr, err := runCommand(hwRaidCLI, "/c0/eall/sall", "show", "rebuild")
+	if err != nil {
+		return nil, fmt.Errorf("perccli64 rebuild check failed: %w (stderr: %s)", err, stderr)
+	}
+
+	var rebuilds []HWRaidRebuildInfo
+	lines := strings.Split(stdout, "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "-") || strings.HasPrefix(trimmed, "Drive-ID") {
+			continue
+		}
+		// Skip header/footer lines
+		if strings.HasPrefix(trimmed, "Controller") || strings.HasPrefix(trimmed, "Status") ||
+			strings.HasPrefix(trimmed, "Description") || !strings.HasPrefix(trimmed, "/c") {
+			continue
+		}
+
+		fields := strings.Fields(trimmed)
+		if len(fields) < 3 {
+			continue
+		}
+
+		driveID := fields[0]
+
+		if strings.Contains(trimmed, "Not in progress") {
+			continue
+		}
+
+		if strings.Contains(trimmed, "In progress") {
+			pct := fields[1] + "%"
+			info := HWRaidRebuildInfo{
+				DriveID:      driveID,
+				DriveName:    mapDriveIDToName(driveID),
+				RebuildPct:   pct,
+				IsRebuilding: true,
+				RawOutput:    stdout,
+			}
+			rebuilds = append(rebuilds, info)
+		}
+	}
+	return rebuilds, nil
+}
+
+// mapDriveIDToName maps a perccli64 drive ID (e.g. /c0/e32/s3) to a config disk name via megaraid type.
+// Created: 2026-02-28 — Extracts slot number from drive ID and matches against member_disks config
+func mapDriveIDToName(driveID string) string {
+	// Extract slot number from /c0/e32/s3 -> "3"
+	parts := strings.Split(driveID, "/")
+	if len(parts) < 4 {
+		return driveID
+	}
+	slotPart := parts[3] // "s3"
+	if !strings.HasPrefix(slotPart, "s") {
+		return driveID
+	}
+	slotNum := strings.TrimPrefix(slotPart, "s")
+
+	// Match against config member_disks type field: "megaraid,3"
+	for _, d := range cfg.RAID.MemberDisks {
+		if d.Type == "megaraid,"+slotNum {
+			return d.Name
+		}
+	}
+	return "Slot " + slotNum
+}
+
+// checkHWRebuildProgress checks hardware RAID rebuild status and sends progress/completion emails.
+// Created: 2026-02-28 — HW RAID equivalent of the SW RAID checkRebuildProgress logic
+func checkHWRebuildProgress() {
+	if hwRaidCLI == "" {
+		logger.Printf("WARNING: No perccli64/storcli64 found — cannot check HW RAID rebuild status")
+		return
+	}
+
+	rebuilds, err := parsePercRebuildProgress()
+	if err != nil {
+		logger.Printf("HW RAID rebuild check failed: %v", err)
+		return
+	}
+
+	state.mu.Lock()
+	wasRebuilding := state.RebuildWasActive
+	lastPct := state.LastRebuildPct
+	state.mu.Unlock()
+
+	isRebuilding := len(rebuilds) > 0
+
+	if isRebuilding {
+		// Determine highest percentage across all rebuilding drives
+		maxPct := ""
+		for _, r := range rebuilds {
+			if maxPct == "" || r.RebuildPct > maxPct {
+				maxPct = r.RebuildPct
+			}
+		}
+
+		state.mu.Lock()
+		state.RebuildWasActive = true
+		state.LastRebuildPct = maxPct
+		state.mu.Unlock()
+		saveState()
+
+		driveNames := make([]string, len(rebuilds))
+		for i, r := range rebuilds {
+			driveNames[i] = fmt.Sprintf("%s (%s) at %s", r.DriveName, r.DriveID, r.RebuildPct)
+		}
+		logger.Printf("HW RAID rebuild in progress: %s (was: %s)", strings.Join(driveNames, ", "), lastPct)
+		sendHWRebuildProgressEmail(rebuilds)
+	} else if wasRebuilding {
+		// Rebuild just completed
+		state.mu.Lock()
+		state.RebuildWasActive = false
+		state.LastRebuildPct = "100%"
+		state.mu.Unlock()
+		saveState()
+
+		logger.Printf("HW RAID rebuild completed! Sending completion notification")
+		sendHWRebuildCompleteEmail()
+	}
+}
+
+// sendHWRebuildProgressEmail sends an HTML email with HW RAID rebuild progress details.
+// Created: 2026-02-28 — Progress bar, drive table, and raw CLI output for hardware RAID rebuilds
+func sendHWRebuildProgressEmail(rebuilds []HWRaidRebuildInfo) {
+	// Use first rebuilding drive's percentage for subject line
+	pctDisplay := rebuilds[0].RebuildPct
+	subject := fmt.Sprintf("Gslmon Information from %s: HW RAID Rebuild Progress — %s",
+		cfg.Email.ServerName, pctDisplay)
+
+	// Parse numeric percentage for progress bar
+	pctNum := 0.0
+	pctStr := strings.TrimSuffix(pctDisplay, "%")
+	if v, err := strconv.ParseFloat(pctStr, 64); err == nil {
+		pctNum = v
+	}
+
+	var content strings.Builder
+
+	content.WriteString(`<div class="section">`)
+	content.WriteString(`<div class="section-title">Hardware RAID Rebuild Progress</div>`)
+	content.WriteString(fmt.Sprintf(`<p class="info-text"><span class="badge badge-warn">REBUILDING</span> `))
+	content.WriteString(fmt.Sprintf(`Controller <strong>%s</strong> has an active rebuild.</p>`,
+		escHTML(cfg.RAID.RAIDLevel)))
+
+	// Visual progress bar (primary drive)
+	content.WriteString(fmt.Sprintf(`<div class="progress-bar"><div class="progress-fill" style="width:%.1f%%"></div></div>`, pctNum))
+	content.WriteString(fmt.Sprintf(`<p class="progress-text" style="text-align:center;">%s complete</p>`, escHTML(pctDisplay)))
+
+	// Rebuilding drives table
+	content.WriteString(`<table>`)
+	content.WriteString(`<tr><th>Drive ID</th><th>Name</th><th>Progress</th><th>Status</th></tr>`)
+	for _, r := range rebuilds {
+		content.WriteString(fmt.Sprintf(`<tr><td>%s</td><td>%s</td><td><strong>%s</strong></td><td><span class="status-warn">Rebuilding</span></td></tr>`,
+			escHTML(r.DriveID), escHTML(r.DriveName), escHTML(r.RebuildPct)))
+	}
+	content.WriteString(`</table>`)
+	content.WriteString(`</div>`)
+
+	// Controller info table
+	content.WriteString(`<div class="section">`)
+	content.WriteString(`<div class="section-title">Controller Details</div>`)
+	content.WriteString(`<table>`)
+	content.WriteString(`<tr><th>Parameter</th><th>Value</th></tr>`)
+	content.WriteString(fmt.Sprintf(`<tr><td>Controller</td><td>%s</td></tr>`, escHTML(cfg.RAID.RAIDLevel)))
+	content.WriteString(fmt.Sprintf(`<tr><td>Server</td><td>%s</td></tr>`, escHTML(cfg.Email.ServerName)))
+	content.WriteString(fmt.Sprintf(`<tr><td>Drives Rebuilding</td><td>%d</td></tr>`, len(rebuilds)))
+	content.WriteString(fmt.Sprintf(`<tr><td>CLI Tool</td><td>%s</td></tr>`, escHTML(hwRaidCLI)))
+	content.WriteString(`</table>`)
+	content.WriteString(`</div>`)
+
+	// Raw CLI output
+	if len(rebuilds) > 0 && rebuilds[0].RawOutput != "" {
+		content.WriteString(`<div class="section">`)
+		content.WriteString(`<div class="section-title">Raw CLI Output</div>`)
+		content.WriteString(fmt.Sprintf(`<div class="command-block">%s /c0/eall/sall show rebuild</div>`, escHTML(filepath.Base(hwRaidCLI))))
+		content.WriteString(`<div class="log-block">` + escHTML(rebuilds[0].RawOutput) + `</div>`)
+		content.WriteString(`</div>`)
+	}
+
+	htmlBody := buildHTMLPage("HW RAID Rebuild Progress", "&#9881;", content.String())
+
+	if err := sendEmail(subject, htmlBody); err != nil {
+		logger.Printf("Failed to send HW rebuild progress email: %v", err)
+	} else {
+		logger.Printf("HW rebuild progress email sent: %s", subject)
+	}
+}
+
+// sendHWRebuildCompleteEmail sends an HTML email confirming HW RAID rebuild completion.
+// Created: 2026-02-28 — Fetches final drive states via perccli64 and sends completion badge email
+func sendHWRebuildCompleteEmail() {
+	subject := fmt.Sprintf("Gslmon Information from %s: HW RAID Rebuild Complete — All Drives Online",
+		cfg.Email.ServerName)
+
+	var content strings.Builder
+
+	content.WriteString(`<div class="section">`)
+	content.WriteString(`<div class="section-title">Hardware RAID Rebuild Complete</div>`)
+	content.WriteString(fmt.Sprintf(`<p class="info-text"><span class="badge badge-info">COMPLETE</span> `))
+	content.WriteString(fmt.Sprintf(`The hardware RAID rebuild on <strong>%s</strong> (%s) has completed successfully.</p>`,
+		escHTML(cfg.Email.ServerName), escHTML(cfg.RAID.RAIDLevel)))
+	content.WriteString(`</div>`)
+
+	// Fetch final drive states
+	if hwRaidCLI != "" {
+		stdout, _, err := runCommand(hwRaidCLI, "/c0/eall/sall", "show")
+		if err == nil && stdout != "" {
+			content.WriteString(`<div class="section">`)
+			content.WriteString(`<div class="section-title">Current Drive States</div>`)
+			content.WriteString(fmt.Sprintf(`<div class="command-block">%s /c0/eall/sall show</div>`, escHTML(filepath.Base(hwRaidCLI))))
+			content.WriteString(`<div class="log-block">` + escHTML(stdout) + `</div>`)
+			content.WriteString(`</div>`)
+		}
+
+		// Also fetch controller topology
+		stdout2, _, err2 := runCommand(hwRaidCLI, "/c0", "show")
+		if err2 == nil && stdout2 != "" {
+			content.WriteString(`<div class="section">`)
+			content.WriteString(`<div class="section-title">Controller Topology</div>`)
+			content.WriteString(fmt.Sprintf(`<div class="command-block">%s /c0 show</div>`, escHTML(filepath.Base(hwRaidCLI))))
+			content.WriteString(`<div class="log-block">` + escHTML(stdout2) + `</div>`)
+			content.WriteString(`</div>`)
+		}
+	}
+
+	htmlBody := buildHTMLPage("HW RAID Rebuild Complete", "&#9989;", content.String())
+
+	if err := sendEmail(subject, htmlBody); err != nil {
+		logger.Printf("Failed to send HW rebuild complete email: %v", err)
+	} else {
+		logger.Printf("HW rebuild complete email sent: %s", subject)
+	}
+}
+
+// ==================== RAID Array Health for SMART Reports ====================
+
+// checkArrayHealth checks the RAID array state and returns whether it is degraded.
+// Created: 2026-03-01 — Prevents misleading "All Disks OK" in SMART reports when array is degraded
+func checkArrayHealth() (bool, string) {
+	if cfg.RAID.ArrayDevice != "" {
+		// Software RAID — check /proc/mdstat
+		info, err := parseMdstat()
+		if err != nil {
+			logger.Printf("Array health check failed: %v", err)
+			return false, ""
+		}
+		if strings.Contains(info.ArrayState, "degraded") {
+			msg := fmt.Sprintf("Array %s is DEGRADED — %d/%d disks active [%s]",
+				cfg.RAID.ArrayDevice, info.ActiveDisks, info.TotalDisks, info.DiskStatus)
+			if info.IsRebuilding {
+				msg += fmt.Sprintf(" — rebuild in progress: %s", info.RebuildPct)
+			}
+			return true, msg
+		}
+		return false, fmt.Sprintf("Array %s is healthy — %d/%d disks active [%s]",
+			cfg.RAID.ArrayDevice, info.ActiveDisks, info.TotalDisks, info.DiskStatus)
+	} else if isHardwareRAID() && hwRaidCLI != "" {
+		// Hardware RAID — check virtual drive state via perccli64 /c0/v0 show
+		// Updated: 2026-03-01 — Uses VD state line only, avoids false match on legend text
+		stdout, _, err := runCommand(hwRaidCLI, "/c0/v0", "show")
+		if err != nil {
+			logger.Printf("HW RAID array health check failed: %v", err)
+			return false, ""
+		}
+		// Parse only the data line (e.g. "0/0   RAID10 Optl  RW ...") not the legend
+		isDegraded := false
+		isRebuilding := false
+		vdState := ""
+		for _, line := range strings.Split(stdout, "\n") {
+			trimmed := strings.TrimSpace(line)
+			// VD data lines start with "digit/" (e.g. "0/0")
+			if len(trimmed) > 2 && trimmed[0] >= '0' && trimmed[0] <= '9' && strings.Contains(trimmed, "/") {
+				fields := strings.Fields(trimmed)
+				if len(fields) >= 3 {
+					vdState = fields[2] // State column: Optl, Dgrd, Pdgd, Rec, etc.
+					if vdState == "Dgrd" || vdState == "Pdgd" {
+						isDegraded = true
+					}
+					if vdState == "Rec" {
+						isDegraded = true
+						isRebuilding = true
+					}
+				}
+				break
+			}
+		}
+		if isDegraded {
+			msg := fmt.Sprintf("Controller %s is DEGRADED (VD state: %s)", cfg.RAID.RAIDLevel, vdState)
+			if isRebuilding {
+				msg += " — rebuild in progress"
+			}
+			return true, msg
+		}
+		return false, fmt.Sprintf("Controller %s — all drives online (VD state: %s)", cfg.RAID.RAIDLevel, vdState)
+	}
+	return false, ""
 }
 
 // ==================== Startup Health Check ====================
@@ -1772,6 +2301,12 @@ func main() {
 		logger.Printf("Array: %s (%s) on %s", cfg.RAID.ArrayDevice, cfg.RAID.RAIDLevel, cfg.RAID.MountPoint)
 	} else {
 		logger.Printf("RAID: %s (no software RAID — hardware controller)", cfg.RAID.RAIDLevel)
+		hwRaidCLI = detectHWRaidCLI()
+		if hwRaidCLI != "" {
+			logger.Printf("HW RAID CLI tool: %s", hwRaidCLI)
+		} else {
+			logger.Printf("WARNING: No perccli64/storcli64 found — HW RAID rebuild monitoring disabled")
+		}
 	}
 	diskNames := make([]string, len(cfg.RAID.MemberDisks))
 	for i, d := range cfg.RAID.MemberDisks {
@@ -1788,6 +2323,8 @@ func main() {
 	if cfg.RAID.ArrayDevice != "" {
 		logger.Printf("mdstat check: %ds, Rebuild check: %dm",
 			cfg.Monitor.MdstatCheckIntervalSec, cfg.Monitor.RebuildCheckIntervalMin)
+	} else if isHardwareRAID() {
+		logger.Printf("Rebuild check: %dm (hardware RAID)", cfg.Monitor.RebuildCheckIntervalMin)
 	}
 	logger.Printf("Alert cooldown: %d minutes", cfg.Monitor.AlertCooldownMin)
 	logger.Printf("Email: %s -> %s via %s:%d",
@@ -1807,18 +2344,19 @@ func main() {
 	// Send startup notification
 	sendStartupEmail()
 
-	// Start monitoring goroutines — mdstat and rebuild only for software RAID
+	// Start monitoring goroutines
 	// Updated: 2026-02-12 — Conditional goroutines based on RAID type
-	goroutineCount := 2 // logs + smart always run
+	// Updated: 2026-02-28 — Rebuild monitor always runs (dispatches to SW or HW path)
+	goroutineCount := 3 // logs + smart + rebuild always run
 	if cfg.RAID.ArrayDevice != "" {
-		goroutineCount += 2 // mdstat + rebuild only for software RAID
+		goroutineCount += 1 // mdstat only for software RAID
 	}
 	wg.Add(goroutineCount)
 	go monitorLogs(stopCh, &wg)
 	go monitorSmart(stopCh, &wg)
+	go monitorRebuild(stopCh, &wg)
 	if cfg.RAID.ArrayDevice != "" {
 		go monitorMdstat(stopCh, &wg)
-		go monitorRebuild(stopCh, &wg)
 	}
 
 	// Wait for shutdown signal

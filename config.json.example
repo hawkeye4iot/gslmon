@@ -51,7 +51,19 @@
             "disable device",
             "FPDMA",
             "hard resetting link",
-            "link is slow"
+            "link is slow",
+            "exception Emask",
+            "link is slow to respond",
+            "reset failed",
+            "Buffer I/O error",
+            "Remounting filesystem read-only",
+            "sector.*error",
+            "medium error",
+            "task abort",
+            "revalidation failed",
+            "lost page write",
+            "Input/output error",
+            "SATA link down"
         ],
         "smart_critical_attribute_ids": [5, 10, 171, 172, 184, 187, 188, 197, 198, 199, 201]
     },
